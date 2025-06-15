@@ -371,3 +371,155 @@ def recommend_genai(user_query, top_n=10):
     return pd.DataFrame({
         "movie_title": recommended_titles
     }, index=range(1, top_n + 1))
+
+# ----------------------------  RESULTS  -----------------------------
+# --------------------------------------------------------------------
+
+from sklearn.decomposition import TruncatedSVD
+
+def recommend_svd_sklearn_fold(train_df, user_id, num_recommendations=10):
+    """
+    Trains SVD using the given train_df and returns top-N recommendations for the user_id.
+    """
+
+    train_matrix = train_df.pivot(index="user_id", columns="item_id", values="rating")
+    if user_id not in train_matrix.index:
+        return pd.DataFrame({"movie_title": [], "movie_id": []})
+
+    # Normalize: subtract user means
+    user_means = train_matrix.mean(axis=1).fillna(0)
+    norm_matrix = train_matrix.sub(user_means, axis=0).fillna(0)
+
+    # Apply SVD
+    svd = TruncatedSVD(n_components=50, random_state=42)
+    reduced = svd.fit_transform(norm_matrix)
+    reconstructed = np.dot(reduced, svd.components_)
+
+    predicted_ratings = pd.DataFrame(reconstructed, index=train_matrix.index, columns=train_matrix.columns)
+    predicted_ratings = predicted_ratings.add(user_means, axis=0)
+
+    # Get top-N unseen recommendations
+    user_row = predicted_ratings.loc[user_id]
+    seen = train_matrix.loc[user_id][train_matrix.loc[user_id].notna()].index
+    unseen = user_row.drop(seen, errors='ignore').sort_values(ascending=False).head(num_recommendations)
+
+    movie_titles = items.set_index("movie_id").loc[unseen.index]["movie_title"]
+
+    return pd.DataFrame({
+        "movie_id": unseen.index,
+        "movie_title": movie_titles.values
+    })
+
+def recommend_hybrid_fold(train_df, user_id, num_recommendations=10):
+    """
+    Combines SVD and content-based recommendations using a weighted average.
+    """
+
+    # --- SVD Scores ---
+    svd_recs = recommend_svd_sklearn_fold(train_df, user_id, num_recommendations * 2)
+    svd_scores = pd.Series([1.0 - (i / len(svd_recs)) for i in range(len(svd_recs))], index=svd_recs["movie_id"])
+
+    # --- Content Scores ---
+    cb_recs = recommend_content_based(user_id, num_recommendations * 2)
+    cb_recs = cb_recs.merge(items[["movie_id", "movie_title"]], on="movie_title", how="left")
+    cb_scores = pd.Series([1.0 - (i / len(cb_recs)) for i in range(len(cb_recs))], index=cb_recs["movie_id"])
+
+    # --- Combine and Rank ---
+    combined_scores = (svd_scores.add(cb_scores, fill_value=0)) / 2
+    top_n = combined_scores.sort_values(ascending=False).head(num_recommendations)
+    top_titles = items.set_index("movie_id").loc[top_n.index]["movie_title"]
+
+    return pd.DataFrame({
+        "movie_id": top_n.index,
+        "movie_title": top_titles.values
+    })
+
+def evaluate_models_on_folds():
+    """
+    Evaluates all models on u1-u5 folds and returns two DataFrames:
+    - rmse_df: RMSE values for rating predictions
+    - pr_df: Precision@10 and Recall@10 values for top-N recommendations
+    """
+
+    models_rmse = {
+        "svd": [],
+    }
+    models_pr = {
+        "user": [],
+        "item": [],
+        "content": [],
+        "svd": [],
+        "hybrid": []
+    }
+
+    for fold in range(1, 6):
+        train_path = f"ml-100k/u{fold}.base"
+        test_path = f"ml-100k/u{fold}.test"
+
+        train_df = pd.read_csv(train_path, sep="\t", names=["user_id", "item_id", "rating", "timestamp"])
+        test_df = pd.read_csv(test_path, sep="\t", names=["user_id", "item_id", "rating", "timestamp"])
+
+        # --- RMSE for SVD ---
+        train_matrix = train_df.pivot(index="user_id", columns="item_id", values="rating")
+        user_means = train_matrix.mean(axis=1)
+        norm_matrix = train_matrix.sub(user_means, axis=0).fillna(0)
+
+        from sklearn.decomposition import TruncatedSVD
+        svd = TruncatedSVD(n_components=50, random_state=42)
+        reduced = svd.fit_transform(norm_matrix)
+        reconstructed = np.dot(reduced, svd.components_)
+
+        predicted_ratings = pd.DataFrame(reconstructed, index=train_matrix.index, columns=train_matrix.columns)
+        predicted_ratings = predicted_ratings.add(user_means, axis=0)
+
+        true, pred = [], []
+        for _, row in test_df.iterrows():
+            u, i, r = row["user_id"], row["item_id"], row["rating"]
+            if u in predicted_ratings.index and i in predicted_ratings.columns:
+                true.append(r)
+                pred.append(predicted_ratings.loc[u, i])
+
+        rmse = round(sqrt(mean_squared_error(true, pred)), 4)
+        models_rmse["svd"].append(rmse)
+
+        # --- Precision & Recall @10 for all models ---
+        def precision_recall_at_10(model_func):
+            precisions = []
+            recalls = []
+            for user_id in test_df["user_id"].unique():
+                relevant = test_df[(test_df["user_id"] == user_id) & (test_df["rating"] >= 4)]["item_id"].tolist()
+                if not relevant:
+                    continue
+                try:
+                    recs = model_func(user_id, num_recommendations=10)
+                    recommended = items.set_index("movie_title").loc[recs["movie_title"]].index.tolist()
+                except:
+                    continue
+
+                tp = len([item for item in recommended if item in relevant])
+                precisions.append(tp / 10)
+                recalls.append(tp / len(relevant))
+
+            return round(np.mean(precisions), 4), round(np.mean(recalls), 4)
+
+        for name, func in [
+            ("user", recommend_user_based),
+            ("item", recommend_item_based),
+            ("content", recommend_content_based),
+            ("svd", lambda uid, n=10: recommend_svd_sklearn_fold(train_df, uid, n)),
+            ("hybrid", lambda uid, n=10: recommend_hybrid_fold(train_df, uid, n))
+        ]:
+            p, r = precision_recall_at_10(func)
+            models_pr[name].append((p, r))
+
+    # --- Build RMSE DataFrame ---
+    rmse_df = pd.DataFrame(models_rmse, index=[f"Fold {i}" for i in range(1, 6)])
+
+    # --- Build Precision/Recall DataFrame ---
+    pr_rows = []
+    for model, values in models_pr.items():
+        for i, (p, r) in enumerate(values):
+            pr_rows.append({"Model": model, "Fold": f"Fold {i+1}", "Precision@10": p, "Recall@10": r})
+    pr_df = pd.DataFrame(pr_rows)
+
+    return rmse_df, pr_df
